@@ -5,6 +5,5 @@
   "scripts": {
     "build": "echo 'Building...'",
     "start": "node server.js"
-  },
-  "dependencies": {}
+  }
 }
