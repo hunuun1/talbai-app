@@ -1,4 +1,4 @@
-rootDirectory: functions
+rootDirectory: genkit-functions
 runConfig:
   cpu: 1
   memoryMiB: 1024
