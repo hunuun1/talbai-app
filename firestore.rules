@@ -1,0 +1,205 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isBlockedPair(chatId) {
+      return exists(/databases/$(database)/documents/blocks/$(chatId.split('_')[0])/list/$(chatId.split('_')[1])) ||
+             exists(/databases/$(database)/documents/blocks/$(chatId.split('_')[1])/list/$(chatId.split('_')[0]));
+    }
+    function isRoomOwner(roomId) {
+      return get(/databases/$(database)/documents/rooms/$(roomId)).data.ownerUid == request.auth.uid;
+    }
+    function isRoomMember(roomId) {
+      return exists(/databases/$(database)/documents/rooms/$(roomId)/members/$(request.auth.uid));
+    }
+
+    match /profiles/{userId} {
+      allow read: if resource.data.private == false || request.auth.uid == userId;
+      // Defense in depth alongside the client-side age gate — a numeric 18+ age and
+      // an explicit ageVerified flag must be present on every profile write.
+      allow create, update: if request.auth != null && request.auth.uid == userId &&
+        request.resource.data.age is number && request.resource.data.age >= 18 &&
+        request.resource.data.ageVerified == true;
+      allow delete: if request.auth.uid == userId;
+    }
+
+    match /publicKeys/{userId} {
+      // Deliberately its own collection, not a field on `profiles` — a
+      // private profile is unreadable by anyone but its owner (see above),
+      // which would've silently broken encryption for any chat partner with
+      // a private profile. A public key has no confidentiality requirement
+      // by definition, so it gets its own fully-public-read collection.
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    match /presence/{userId} {
+      // Same fully-public-read / own-write-only shape as publicKeys — "is this
+      // person online" carries no confidentiality requirement, and needs to be
+      // readable by anyone who might see them in a chat list or thread.
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    match /chats/{chatId} {
+      // Parent doc used purely as an atomic dedup lock: whichever side's
+      // connect() transaction wins the create is the only one that ever
+      // sends the greeting message, even if both participants tap "Say hi"
+      // on each other around the same moment.
+      allow read: if request.auth != null && request.auth.uid in chatId.split('_');
+      allow create: if request.auth != null && request.auth.uid in chatId.split('_') &&
+        request.resource.data.pair == chatId.split('_');
+      // Either participant can flip the encrypted-mode flag — it's a shared
+      // setting both sides see the same value for, unlike mute/archive/
+      // nickname which live on each person's own chatIndex item. `pair` stays
+      // immutable so this can't be used to rewrite chat identity.
+      allow update: if request.auth != null && request.auth.uid in chatId.split('_') &&
+        request.resource.data.pair == resource.data.pair;
+      allow delete: if false;
+    }
+
+    match /chats/{chatId}/messages/{messageId} {
+      // Blocking a user locks the whole 1:1 thread both ways — this is the actual
+      // safety boundary, not just a client-side UI hide, so it has to live here.
+      // Update/delete is further scoped to your own messages only — a participant
+      // being able to edit or delete the OTHER person's messages was a real gap.
+      // Photo messages carry a moderationStatus set by the Cloud Vision scan
+      // (Cloud Function, Admin SDK). Until it clears "approved", only the
+      // sender can read it back — the recipient's onSnapshot listener just
+      // never receives it. Messages with no moderationStatus field at all
+      // (everything sent before this feature shipped, and every text-only
+      // message) stay visible exactly as before.
+      allow read: if request.auth != null &&
+        request.auth.uid in chatId.split('_') && !isBlockedPair(chatId) &&
+        (resource.data.from == request.auth.uid ||
+         !('moderationStatus' in resource.data) ||
+         resource.data.moderationStatus == 'approved');
+      allow create: if request.auth != null &&
+        request.auth.uid in chatId.split('_') && !isBlockedPair(chatId) &&
+        request.resource.data.from == request.auth.uid;
+      // Reactions are the one case where the OTHER participant needs write
+      // access to your message — but only to touch their own key inside the
+      // reactions map, never the message content itself. hasOnly(['reactions'])
+      // on the top-level diff plus hasOnly([uid]) on the reactions-map diff
+      // together make sure "reacting" can't be used as a backdoor to edit
+      // someone else's text/photos.
+      allow update: if request.auth != null &&
+        request.auth.uid in chatId.split('_') && !isBlockedPair(chatId) &&
+        (resource.data.from == request.auth.uid ||
+         (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions']) &&
+          request.resource.data.reactions.diff(resource.data.get('reactions', {})).affectedKeys().hasOnly([request.auth.uid])));
+      allow delete: if request.auth != null &&
+        request.auth.uid in chatId.split('_') && !isBlockedPair(chatId) &&
+        resource.data.from == request.auth.uid;
+    }
+
+    match /chatIndex/{userId}/items/{chatId} {
+      // Read stays private to the owner. Write is scoped to either participant of
+      // THIS specific chat (chatId encodes both uids) — necessary because connecting
+      // two people, or updating the last-message preview, has to populate both
+      // sides' chat lists, and a user can't write into someone else's subtree
+      // otherwise. Can't be used to touch a chatIndex item for any chat the writer
+      // isn't actually part of.
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow write: if request.auth != null && request.auth.uid in chatId.split('_');
+    }
+
+    match /chats/{chatId}/typing/{uid} {
+      allow read, write: if request.auth != null &&
+        request.auth.uid in chatId.split('_') && request.auth.uid == uid && !isBlockedPair(chatId);
+    }
+
+    match /chats/{chatId}/reads/{uid} {
+      // Both participants can read each other's read-marker (that's the whole
+      // point — it's how you see your own sent messages got seen), but you can
+      // only ever move your own marker forward.
+      allow read: if request.auth != null && request.auth.uid in chatId.split('_') && !isBlockedPair(chatId);
+      allow write: if request.auth != null && request.auth.uid == uid &&
+        request.auth.uid in chatId.split('_') && !isBlockedPair(chatId);
+    }
+
+    match /blocks/{userId}/list/{blockedUid} {
+      // Your block list is private — the blocked person is never told they were blocked.
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    match /reports/{reportId} {
+      // Reports are write-only from the client — only reviewable via the Admin SDK /
+      // Firebase console, never readable by any end user (including the reporter).
+      allow create: if request.auth != null && request.auth.uid == request.resource.data.reporterUid;
+      allow read, update, delete: if false;
+    }
+
+    match /clientErrors/{errorId} {
+      // Write-only crash log, same governance as reports. Allowed even signed-out
+      // since crashes can happen before auth resolves (e.g. sign-in itself
+      // failing) — minimal shape check just filters obvious junk writes.
+      allow create: if request.resource.data.message is string &&
+        request.resource.data.message.size() < 2000;
+      allow read, update, delete: if false;
+    }
+
+    match /rooms/{roomId} {
+      // Room metadata (title, description, price) is browsable by anyone,
+      // signed in or not, so people can decide whether to pay to join.
+      allow read: if true;
+      allow create: if request.auth != null && request.auth.uid == request.resource.data.ownerUid &&
+        request.resource.data.memberCount == 0;
+      // memberCount is only ever changed by the Cloud Function (Admin SDK, bypasses
+      // rules) when a payment actually goes through — the owner can edit their own
+      // room's title/price/etc, but can't inflate their own member count.
+      allow update: if request.auth != null && request.auth.uid == resource.data.ownerUid &&
+        request.resource.data.memberCount == resource.data.memberCount;
+      allow delete: if request.auth != null && request.auth.uid == resource.data.ownerUid;
+
+      match /members/{uid} {
+        // Access is only ever granted by the Cloud Function (Admin SDK,
+        // which bypasses rules) once a payment is confirmed — never by clients.
+        allow read: if request.auth != null && (request.auth.uid == uid || isRoomOwner(roomId));
+        allow write: if false;
+      }
+
+      match /messages/{messageId} {
+        // Same own-message-only pattern as 1:1 chats, plus the room owner can
+        // delete (moderate) anyone's message — but not edit their words.
+        // Same moderationStatus gate as 1:1 chats; the room owner also sees
+        // pending/flagged photos since they're the one who can remove them.
+        allow read: if request.auth != null && (isRoomOwner(roomId) || isRoomMember(roomId)) &&
+          (resource.data.from == request.auth.uid || isRoomOwner(roomId) ||
+           !('moderationStatus' in resource.data) ||
+           resource.data.moderationStatus == 'approved');
+        allow create: if request.auth != null && (isRoomOwner(roomId) || isRoomMember(roomId)) &&
+          request.resource.data.from == request.auth.uid;
+        // Every "delete" in this app is actually a soft-delete update (sets
+        // deleted: true, clears content, keeps a placeholder) — the room
+        // owner's moderation path has to be an update rule for that reason,
+        // not the separate `allow delete` below, which the client never
+        // calls for room messages. hasOnly() pins the owner to exactly the
+        // fields deleteMessage() writes, so "moderating" can't be used to
+        // rewrite someone else's text/attachments to something new.
+        // Reactions mirror the 1:1 chat rule: any member (not just the
+        // sender) can touch the message, but only their own key inside
+        // reactions, nothing else — same hasOnly() double-check pattern.
+        allow update: if request.auth != null &&
+          ((resource.data.from == request.auth.uid && (isRoomOwner(roomId) || isRoomMember(roomId))) ||
+           (isRoomOwner(roomId) && request.resource.data.deleted == true &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(
+              ['deleted', 'text', 'photoUrls', 'photoUrl', 'videoUrl', 'fileUrl', 'fileName', 'fileSize', 'fileType', 'audioUrl', 'audioDuration']
+            )) ||
+           ((isRoomOwner(roomId) || isRoomMember(roomId)) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions']) &&
+            request.resource.data.reactions.diff(resource.data.get('reactions', {})).affectedKeys().hasOnly([request.auth.uid])));
+        allow delete: if request.auth != null && (isRoomOwner(roomId) || isRoomMember(roomId)) &&
+          (resource.data.from == request.auth.uid || isRoomOwner(roomId));
+      }
+    }
+
+    // Watch hub CMS — public read, owner-only write via profile.role == "admin"
+    // (client also gates UI with VITE_ADMIN_UIDS / isOwner).
+    match /watchReplays/{replayId} {
+      allow read: if request.auth != null;
+      allow create, update, delete: if request.auth != null &&
+        get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.role == "admin";
+    }
+  }
+}
+
