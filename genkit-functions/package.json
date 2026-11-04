@@ -1,7 +1,11 @@
 {
   "name": "genkit-functions",
+  "version": "1.0.0",
+  "private": true,
   "scripts": {
-    "build": "npm run tsc",
-    "start": "node lib/index.js"
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
   }
 }
